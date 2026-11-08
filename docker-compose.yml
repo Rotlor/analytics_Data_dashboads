@@ -1,0 +1,96 @@
+name: hhbi_mvp
+
+x-redash-service: &redash-service
+  image: redash/redash:10.1.0.b50633
+  platform: linux/amd64
+  env_file: .env
+  environment: &redash-env
+    REDASH_REDIS_URL: redis://redis:6379/0
+    REDASH_DATABASE_URL: postgresql://${DWH_USER:-hh_owner}:${DWH_PASSWORD:?Set DWH_PASSWORD}@postgres:5432/redash
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DWH_USER:-hh_owner}
+      POSTGRES_PASSWORD: ${DWH_PASSWORD:?Set DWH_PASSWORD}
+      POSTGRES_DB: redash
+    ports:
+      - "127.0.0.1:${DWH_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d redash"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  redis:
+    image: redis:7.0-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  init-server:
+    <<: *redash-service
+    profiles: [setup]
+    command: create_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  server:
+    <<: *redash-service
+    command: server
+    ports:
+      - "127.0.0.1:${REDASH_PORT:-5050}:5000"
+    environment:
+      <<: *redash-env
+      REDASH_WEB_WORKERS: 2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    <<: *redash-service
+    command: scheduler
+    environment:
+      <<: *redash-env
+      QUEUES: celery
+      WORKERS_COUNT: 1
+    depends_on: [server]
+    restart: unless-stopped
+
+  worker:
+    <<: *redash-service
+    command: worker
+    environment:
+      <<: *redash-env
+      QUEUES: scheduled_queries,schemas,periodic,emails,default,queries
+      WORKERS_COUNT: 2
+    depends_on: [server]
+    restart: unless-stopped
+
+  etl:
+    build: .
+    profiles: [etl]
+    env_file: .env
+    environment:
+      DWH_HOST: postgres
+      DWH_PORT: 5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "src.pipeline"]
+
+volumes:
+  postgres-data:
